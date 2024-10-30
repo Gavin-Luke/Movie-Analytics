@@ -1,33 +1,63 @@
 import scrapy
 import json
 
-class TMDBSpider(scrapy.Spider):
-    name = 'tmdb'
-    api_key = 'YOUR_API_KEY'  
+class TMDBGeneralMoviesSpider(scrapy.Spider):
+    name = 'general'
+    allowed_domains = ['api.themoviedb.org']
+    api_key = 'YOUR_API_KEY'
 
     def start_requests(self):
-        for i in range(1, 60):  # Fetch multiple pages
-            url = f'https://api.themoviedb.org/3/movie/popular?api_key={self.api_key}&language=en-US&page={i}'
-            yield scrapy.Request(url=url, callback=self.parse)
+        url = f'https://api.themoviedb.org/3/discover/movie?api_key={self.api_key}&language=en-US&sort_by=popularity.desc&include_adult=false&include_video=false&page=1'
+        yield scrapy.Request(url=url, callback=self.parse)
 
     def parse(self, response):
-        # Parse the JSON response
-        movies = json.loads(response.body)
+        data = json.loads(response.text)
+        movies = data.get('results', [])
 
-        for movie in movies['results']:
-            movie_id = movie['id']
-            yield scrapy.Request(
-                url=f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={self.api_key}&language=en-US',
-                callback=self.parse_movie,
-                meta={'movie_id': movie_id}
-            )
-   def parse_movie(self, response):
-        data = json.loads(response.body)
+        for movie in movies:
+            movie_id = movie.get('id')  # Get movie ID to make another request for details
+            movie_details_url = f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={self.api_key}&language=en-US'
 
+            # Make a request for detailed movie data (budget, revenue, etc.)
+            yield scrapy.Request(url=movie_details_url, callback=self.parse_movie_details)
+
+        # Pagination handling (for multiple pages of results)
+        next_page = data.get('page', 1) + 1
+        total_pages = data.get('total_pages', 1)
+
+        if next_page <= total_pages:
+            next_url = f'https://api.themoviedb.org/3/discover/movie?api_key={self.api_key}&language=en-US&sort_by=popularity.desc&include_adult=false&include_video=false&page={next_page}'
+            yield scrapy.Request(url=next_url, callback=self.parse)
+
+    def parse_movie_details(self, response):
+        movie_details = json.loads(response.text)
+
+        # Extract certification by making another request for release dates if needed
+        movie_id = movie_details.get('id')
+        release_dates_url = f'https://api.themoviedb.org/3/movie/{movie_id}/release_dates?api_key={self.api_key}'
+
+        # Call another method to handle parsing release_dates
+        yield scrapy.Request(url=release_dates_url, callback=self.parse_release_dates, meta={'movie_details': movie_details})
+
+    def parse_release_dates(self, response):
+        movie_details = response.meta['movie_details']
+        release_dates = json.loads(response.text)
+
+        certification = 'NA'
+        for result in release_dates.get('results', []):
+            if result.get('iso_3166_1') == 'US':  # Extract certification for the US region
+                for release in result.get('release_dates', []):
+                    certification = release.get('certification', 'NA')
+                    break
+
+        # Combine everything and yield the final result
         yield {
-            'title': data.get('title', 'NULL'),
-            'release_date': data.get('release_date', 'NULL'),
-            'genres': ', '.join([genre['name'] for genre in data.get('genres', [])]) or 'NULL',
-            'budget': data.get('budget', 'NULL'),
-            'revenue': data.get('revenue', 'NULL'),
+            'title': movie_details.get('title', 'NA'),
+            'release_date': movie_details.get('release_date', 'NA'),
+            'genres': [genre['name'] for genre in movie_details.get('genres', [])],  # Genre names
+            'rating': movie_details.get('vote_average', 'NA'),
+            'budget': movie_details.get('budget', 'NA'),
+            'revenue': movie_details.get('revenue', 'NA'),
+            'runtime': movie_details.get('runtime', 'NA'),
+            'certification': certification
         }
