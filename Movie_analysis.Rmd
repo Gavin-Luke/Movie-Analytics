@@ -1,0 +1,357 @@
+
+Make sure you've ran the spider or downloaded the csv.
+
+```{r}
+df <- read.csv("movies.csv")
+
+df <- subset(df, budget != 0)
+df <- subset(df, revenue != 0)
+
+```
+The code drops movies with budget or revenue unknown. I played around with k-means clustering to estimate budgets and save some of them, but decided not to.
+
+
+```{r}
+library(glmnet)
+library(priceR)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+```
+
+This code splts our very ugly genres column into nice dummy variables to play around with.
+```{r}
+df %>%
+  # Split the 'genres' column into separate rows for each genre
+  separate_rows(genres, sep = ",") %>%
+  # Trim any extra whitespace from genre names
+  mutate(genres = trimws(genres)) %>%
+  # Create dummy variables (1 for presence, 0 for absence) for each genre
+  mutate(value = 1) %>%
+  pivot_wider(names_from = genres, values_from = value, values_fill = list(value = 0)) -> df_clean
+
+# View the new dataframe
+head(df)
+
+
+```
+
+
+Release dates are considered to be very important for movie revenue. I created dummies for if a movie premeried in winter, spring, summer, or fall. 
+```{r}
+df <- df %>%
+  mutate(release_date = as.Date(release_date)) %>%
+  # Extract month from the release_date
+  mutate(month = month(release_date)) %>%
+  # Create a 'season' variable based on the month
+  mutate(season = case_when(
+    month %in% c(12, 1, 2) ~ "Winter",
+    month %in% c(3, 4, 5)  ~ "Spring",
+    month %in% c(6, 7, 8)  ~ "Summer",
+    month %in% c(9, 10, 11) ~ "Fall"
+  )) %>%
+  # Create dummy variables for each season
+  mutate(
+    is_winter = ifelse(season == "Winter", 1, 0),
+    is_spring = ifelse(season == "Spring", 1, 0),
+    is_summer = ifelse(season == "Summer", 1, 0),
+    is_fall   = ifelse(season == "Fall", 1, 0)
+  )
+```
+
+TMDB has revenue information on movies that are still in theaters and are therefore still earning money. This drops movies released 30 days before access. 
+```{r}
+current_date <- Sys.Date()
+
+# Calculate the cutoff date (one month before the current date)
+cutoff_date <- current_date - lubridate::days(30)  # Adjust for 30 days to account for one month
+
+df$release_date <- as.Date(df$release_date)
+
+# Filter the dataframe to keep only movies released after the cutoff date
+trimmed_df <- df[df$release_date > cutoff_date, ]
+```
+
+Now, we start to adjust budget and revenue for inflation, so all of the movies are weighted on the same scale. All of the money information will be in 2023 dollars.
+```{r}
+
+df$release_year <- year(df$release_date)
+df$adjusted_budget <- adjust_for_inflation(df$budget, df$release_year, "United States", to_date="2023")
+df$adjusted_revenue <- adjust_for_inflation(df$revenue, df$release_year, "United States", to_date="2023")
+
+```
+
+Visualizing revenue over the years
+```{r}
+df_summary <- df %>%
+  group_by(release_year) %>%
+  summarize(avg_adjusted_revenue = mean(adjusted_revenue, na.rm = TRUE))
+
+# Create the line plot
+ggplot(df_summary, aes(x = release_year, y = avg_adjusted_revenue)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red") +
+  labs(title = "Average Adjusted revenue Over Time",
+       x = "Release Year",
+       y = "Average Adjusted revenue") +
+  theme_minimal()
+```
+Now let's take a look at profitable genres
+```{r}
+# First, melt the genre columns to long format (if one-hot encoded)
+df_long <- df %>%
+  pivot_longer(cols = c(Mystery, Thriller, Drama, Crime, Romance, Action, Comedy, 
+                        Animation, Family, Fantasy, Horror, Adventure, War, 
+                        History, Western, Music, Documentary), 
+               names_to = "genre", 
+               values_to = "is_genre") %>%
+  filter(is_genre == 1)
+
+# Summarize total adjusted revenue by genre
+df_genre_revenue <- df_long %>%
+  group_by(genre) %>%
+  summarize(total_adjusted_revenue = sum(adjusted_revenue, na.rm = TRUE))
+
+# Plot the total adjusted revenue by genre
+library(ggplot2)
+
+ggplot(df_genre_revenue, aes(x = reorder(genre, -total_adjusted_revenue), 
+                             y = total_adjusted_revenue)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Total Adjusted Revenue by Genre",
+       x = "Genre", y = "Total Adjusted Revenue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Now, we break into econometrics. For the first model, let's regress adjusted_revenue on everything we got. 
+```{r}
+model1 <- lm(adjusted_revenue ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df)
+summary(model1)
+```
+
+Let's drop some variables that are not statistically significant and add in polynomials for budget and runtime
+```{r}
+model2 <- lm(adjusted_revenue ~ adjusted_budget + runtime + I(runtime^2) + I(adjusted_budget^2) + Mystery + Thriller + Drama + Crime + Action + Comedy + Animation + Fantasy + Adventure + War + History + Western + is_spring + is_fall + is_summer, data=df)
+summary(model2)
+```
+This does a little better, but we have a lot of variables. Let's run Lasso and Ridge regressions
+
+```{r}
+
+df <- na.omit(df)
+# Let's get our independent variables into a matrix
+X <- as.matrix(df[, c("adjusted_budget", "runtime", "Mystery", "Thriller", "Drama", "Crime", "Romance", 
+                      "Action", "Comedy", "Animation", "Family", "Fantasy", "Horror", "Adventure", 
+                      "War", "History", "Western", "Music", "Documentary", "is_winter", "is_fall", 
+                      "is_summer")])
+
+# Add polynomial terms
+X <- cbind(X, I(df$runtime^2), I(df$adjusted_budget^2))
+
+# Dependent variable (revenue) as a vector
+y <- df$adjusted_revenue
+
+```
+
+Here's the lasso:
+```{r}
+lasso_model <- glmnet(X, y, alpha = 1)
+
+# Use cross-validation to find the best lambda
+cv_lasso <- cv.glmnet(X, y, alpha = 1)
+best_lambda_lasso <- cv_lasso$lambda.min
+
+# Fit the final Lasso model with the best lambda
+lasso_final <- glmnet(X, y, alpha = 1, lambda = best_lambda_lasso)
+
+# Look at those coefficients 🔍
+coef(lasso_final)
+
+```
+And the Ridge:
+```{r}
+# Fit Ridge regression (alpha = 0)
+ridge_model <- glmnet(X, y, alpha = 0)
+
+# Cross-validation for the best lambda
+cv_ridge <- cv.glmnet(X, y, alpha = 0)
+best_lambda_ridge <- cv_ridge$lambda.min
+
+# Fit the final Ridge model with the best lambda
+ridge_final <- glmnet(X, y, alpha = 0, lambda = best_lambda_ridge)
+
+# Check out those Ridge coefficients
+coef(ridge_final)
+
+```
+
+```{r}
+# Fit the Lasso and Ridge models using cross-validated lambdas
+cv_lasso <- cv.glmnet(X, y, alpha = 1)
+lasso_final <- glmnet(X, y, alpha = 1, lambda = cv_lasso$lambda.min)
+
+cv_ridge <- cv.glmnet(X, y, alpha = 0)
+ridge_final <- glmnet(X, y, alpha = 0, lambda = cv_ridge$lambda.min)
+
+# Predict the values using the models
+lasso_predictions <- predict(lasso_final, newx = X)
+ridge_predictions <- predict(ridge_final, newx = X)
+
+# Calculate R-squared for Lasso
+SST <- sum((y - mean(y))^2)  # Total sum of squares
+SSE_lasso <- sum((y - lasso_predictions)^2)  # Sum of squared errors for Lasso
+R2_lasso <- 1 - (SSE_lasso / SST)
+
+# Calculate R-squared for Ridge
+SSE_ridge <- sum((y - ridge_predictions)^2)  # Sum of squared errors for Ridge
+R2_ridge <- 1 - (SSE_ridge / SST)
+
+# Print R-squared values
+cat("Lasso R-squared: ", R2_lasso, "\n")
+cat("Ridge R-squared: ", R2_ridge, "\n")
+
+```
+Ok, the models did alright. A Lasso can give a decent model of predicting revenue.
+
+
+What I'm more interested in is making a movie that can break even (BE), i.e be profitable. The "rule of thumb" that is frequently used is a movie breaks even if it makes 2.5 times its production budget. Let's make a dummy variable calculating that. 
+```{r}
+df <- df %>%
+  mutate(BE = ifelse(adjusted_revenue >= 2.5 * adjusted_budget, 1, 0))
+```
+
+
+Now here's a Linear Probability Model with BE as our dependent, and our trusty covariates returning for the sequel
+```{r}
+model3 <- lm(BE ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df)
+summary(model3)
+```
+While this model is awful (see the R-Squared), I think the negative coefficient on adjusted_budget is interesting. Let's add a polynomial for it in our logit and probit, which we run below.
+
+```{r}
+logit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df, family = binomial(link = "logit"))
+summary(logit_model)
+```
+So the sign of adjusted_budget switches with the polynomial. 
+
+```{r}
+probit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df, family = binomial(link = "probit"))
+summary(probit_model)
+```
+Let's see if the probit or the logit is better at predicting our movies
+```{r}
+# 1. Predict probabilities using the models
+logit_probs <- predict(logit_model, type = "response")  # For Logit
+probit_probs <- predict(probit_model, type = "response")  # For Probit
+
+# 2. Convert probabilities to binary predictions (threshold = 0.5)
+logit_preds <- ifelse(logit_probs >= 0.5, 1, 0)  # Logit predictions
+probit_preds <- ifelse(probit_probs >= 0.5, 1, 0)  # Probit predictions
+
+# 3. Create a confusion matrix for Logit
+logit_correct <- sum(logit_preds == df$BE)  # Count correct predictions
+logit_total <- nrow(df)  # Total number of observations
+
+# 4. Create a confusion matrix for Probit
+probit_correct <- sum(probit_preds == df$BE)  # Count correct predictions
+probit_total <- nrow(df)  # Total number of observations
+
+# 5. Print out the results
+cat("Logit Model:\n")
+cat("Correct Predictions: ", logit_correct, "/", logit_total, " (", 
+    round((logit_correct / logit_total) * 100, 2), "%)\n", sep = "")
+    
+cat("Probit Model:\n")
+cat("Correct Predictions: ", probit_correct, "/", probit_total, " (", 
+    round((probit_correct / probit_total) * 100, 2), "%)\n", sep = "")
+
+```
+Our probit just inches out the logit. Again, these models are still not fantastic, but what can you do?
+
+
+
+Now, let's studio produce the movie most likely to break even. We'll assume a fixed budget and runtime at the mean of both, pick two genres and a release date, and it'll break even! The section below uses the probit model to create predictions for which are the most and least likely movies to break even. 
+```{r}
+# Define your fixed budget
+fixed_budget <- mean(df$adjusted_budget)
+fixed_runtime <- mean(df$runtime)
+
+# Define possible genres and seasons
+genres <- c("Mystery", "Thriller", "Drama", "Crime", "Romance", "Action", "Comedy", 
+            "Animation", "Family", "Fantasy", "Horror", "Adventure", "War", "History", 
+            "Western", "Music", "Documentary")
+
+seasons <- c("is_fall", "is_winter", "is_summer", "none")  # none represents no season chosen
+
+# Create combinations of 2 genres
+genre_combinations <- combn(genres, 2, simplify = FALSE)
+
+# Create a dataframe of all possible combinations of 2 genres and 1 season
+library(tidyr)
+
+combinations_df <- expand.grid(genre_combinations = genre_combinations, 
+                               season = seasons, stringsAsFactors = FALSE)
+
+# Split the genre_combinations into separate columns for the two genres
+combinations_df <- combinations_df %>%
+  mutate(genre1 = sapply(genre_combinations, `[`, 1),
+         genre2 = sapply(genre_combinations, `[`, 2)) %>%
+  select(-genre_combinations)
+
+```
+
+
+```{r}
+# Initialize an empty vector to store the probabilities
+combinations_df$predicted_probability <- NA
+
+# Loop through each combination and predict the probability using the probit model
+for (i in 1:nrow(combinations_df)) {
+  
+  # Create a temporary dataframe for this combination
+  temp_df <- data.frame(
+    adjusted_budget = fixed_budget,
+    runtime = fixed_runtime,
+    Mystery = 0, Thriller = 0, Drama = 0, Crime = 0, Romance = 0, Action = 0,
+    Comedy = 0, Animation = 0, Family = 0, Fantasy = 0, Horror = 0, Adventure = 0, 
+    War = 0, History = 0, Western = 0, Music = 0, Documentary = 0,
+    is_fall = 0, is_winter = 0, is_summer = 0
+  )
+  
+  # Set the selected genres to 1
+  temp_df[[combinations_df$genre1[i]]] <- 1
+  temp_df[[combinations_df$genre2[i]]] <- 1
+  
+  # Set the selected season to 1 (if not "none")
+  if (combinations_df$season[i] != "none") {
+    temp_df[[combinations_df$season[i]]] <- 1
+  }
+  
+  # Predict the probability of breaking even using the probit model
+  combinations_df$predicted_probability[i] <- predict(probit_model, newdata = temp_df, type = "response")
+}
+
+```
+
+```{r}
+# Sort the dataframe by predicted probability in descending order
+sorted_combinations_df <- combinations_df[order(-combinations_df$predicted_probability),]
+
+# Get the top 5 combinations with the highest predicted probability
+top_5_combinations <- head(sorted_combinations_df, 15)
+
+# Print the top 5 combinations
+print(top_5_combinations)
+
+
+```
+```{r}
+bottom_5_combinations <- tail(sorted_combinations_df, 15)
+
+# Print the top 5 combinations
+print(bottom_5_combinations)
+```
+
