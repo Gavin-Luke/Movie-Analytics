@@ -29,7 +29,7 @@ df %>%
   mutate(genres = trimws(genres)) %>%
   # Create dummy variables (1 for presence, 0 for absence) for each genre
   mutate(value = 1) %>%
-  pivot_wider(names_from = genres, values_from = value, values_fill = list(value = 0)) -> df_clean
+  pivot_wider(names_from = genres, values_from = value, values_fill = list(value = 0)) -> df
 
 # View the new dataframe
 head(df)
