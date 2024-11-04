@@ -223,6 +223,11 @@ df <- df %>%
   mutate(BE = ifelse(adjusted_revenue >= 2.5 * adjusted_budget, 1, 0))
 ```
 
+Let's see what percentage of movies break even
+```{r}
+BE_number <- round(sum(df$BE)/length(df),2)
+print(sprintf("The percentage of movies that have broken even and been profitable is %.2f%%", BE_number))
+```
 
 Now here's a Linear Probability Model with BE as our dependent, and our trusty covariates returning for the sequel
 ```{r}
