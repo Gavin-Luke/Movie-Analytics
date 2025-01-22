@@ -1,16 +1,6 @@
+Welcome to my independent analysis of movie profitability! I hope you enjoy.
 
-Make sure you've ran the spider or downloaded the csv.
-
-```{r}
-df <- read.csv("movies.csv")
-
-df <- subset(df, budget != 0)
-df <- subset(df, revenue != 0)
-
-```
-The code drops movies with budget or revenue unknown. I played around with k-means clustering to estimate budgets and save some of them, but decided not to.
-
-
+Obligatory package loadings
 ```{r}
 library(glmnet)
 library(priceR)
@@ -18,7 +8,31 @@ library(ggplot2)
 library(lubridate)
 library(dplyr)
 library(tidyr)
+library(pscl)
+library(VIM)
+
 ```
+
+
+I generated the CSV from webscraping The Movie Database (TMDB). You can find the spider in the repository in my Github, linked here: https://github.com/Gavin-Luke/Movie-Analytics
+Remember to get a TMDB API key to replicate it. 
+
+```{r}
+df <- read.csv("movies.csv")
+
+df <- subset(df, revenue != 0)
+
+```
+The code drops movies with revenue unknown. Movies on streaming services or TV movies don't have revenue we can directly analyze, so we can't glean anything from them. However, I think it's still worth it to estimate budgets for some of the movies. We're going to use K Nearest Neighbors, an unsupervised learning technique that estimates values based on how close they are to similar movies.
+
+```{r}
+df <- df %>%
+  mutate(budget = ifelse(budget == 0, NA, budget))
+
+# Apply KNN imputation only to the budget column
+df <- kNN(df, variable = "budget", k = 5, imp_var = FALSE)
+```
+
 
 This code splts our very ugly genres column into nice dummy variables to play around with.
 ```{r}
@@ -97,6 +111,8 @@ ggplot(df_summary, aes(x = release_year, y = avg_adjusted_revenue)) +
        y = "Average Adjusted revenue") +
   theme_minimal()
 ```
+
+
 Now let's take a look at profitable genres
 ```{r}
 # First, melt the genre columns to long format (if one-hot encoded)
@@ -126,15 +142,46 @@ ggplot(df_genre_revenue, aes(x = reorder(genre, -total_adjusted_revenue),
 
 ```
 
+As we move into building models, let's calculate the correlation between adjusted_revenue and the numerical variables we have.
+```{r}
+numerical_vars <- df %>%
+  select(where(is.numeric)) # Select only numeric columns
+
+correlation_matrix <- cor(numerical_vars, use = "complete.obs") # Use 'complete.obs' to handle missing values
+
+cor_with_revenue <- correlation_matrix["adjusted_revenue", ] # Extract correlations for 'adjusted_revenue'
+
+library(corrplot)
+corrplot(correlation_matrix, method = "circle")
+
+```
+
+```{r}
+library(reshape2)
+library(ggplot2)
+
+# Convert correlation matrix to a long format
+cor_long <- melt(correlation_matrix)
+
+# Plot
+ggplot(cor_long, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(title = "Correlation Heatmap", fill = "Correlation")
+
+```
+
+
 Now, we break into econometrics. For the first model, let's regress adjusted_revenue on everything we got. 
 ```{r}
-model1 <- lm(adjusted_revenue ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df)
+model1 <- lm(adjusted_revenue ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer + rating, data=df)
 summary(model1)
 ```
 
 Let's drop some variables that are not statistically significant and add in polynomials for budget and runtime
 ```{r}
-model2 <- lm(adjusted_revenue ~ adjusted_budget + runtime + I(runtime^2) + I(adjusted_budget^2) + Mystery + Thriller + Drama + Crime + Action + Comedy + Animation + Fantasy + Adventure + War + History + Western + is_spring + is_fall + is_summer, data=df)
+model2 <- lm(adjusted_revenue ~ adjusted_budget + runtime + I(runtime^2) + I(adjusted_budget^2) + Mystery + Thriller + Drama + Crime + Action + Comedy + Animation + Fantasy + Adventure + War + History + Western + is_spring + is_fall + is_summer + rating, data=df)
 summary(model2)
 ```
 This does a little better, but we have a lot of variables. Let's run Lasso and Ridge regressions
@@ -145,7 +192,7 @@ df <- na.omit(df)
 # Let's get our independent variables into a matrix
 X <- as.matrix(df[, c("adjusted_budget", "runtime", "Mystery", "Thriller", "Drama", "Crime", "Romance", 
                       "Action", "Comedy", "Animation", "Family", "Fantasy", "Horror", "Adventure", 
-                      "War", "History", "Western", "Music", "Documentary", "is_winter", "is_fall", 
+                      "War", "History", "Western", "Music", "Documentary", "rating", "is_winter",     "is_fall", 
                       "is_summer")])
 
 # Add polynomial terms
@@ -220,7 +267,7 @@ Ok, the models did alright. A Lasso can give a decent model of predicting revenu
 What I'm more interested in is making a movie that can break even (BE), i.e be profitable. The "rule of thumb" that is frequently used is a movie breaks even if it makes 2.5 times its production budget. Let's make a dummy variable calculating that. 
 ```{r}
 df <- df %>%
-  mutate(BE = ifelse(adjusted_revenue >= 2.5 * adjusted_budget, 1, 0))
+  mutate(BE = ifelse(revenue >= 2.5 * budget, 1, 0))
 ```
 
 Let's see what percentage of movies break even
@@ -229,23 +276,61 @@ BE_number <- round(sum(df$BE)/length(df),2)
 print(sprintf("The percentage of movies that have broken even and been profitable is %.2f%%", BE_number))
 ```
 
+```{r}
+df$release_date <- as.Date(df$release_date)
+
+# Extract the year from release_date
+df <- df %>%
+  mutate(release_year = format(release_date, "%Y"))
+
+# Filter and count movies with BE = 1 over time
+movies_BE <- df %>%
+  filter(BE == 1) %>%                 # Only include movies that break even
+  group_by(release_year) %>%          # Group by release year
+  summarise(count_BE = n())           # Count the number of movies per year
+
+# Plot the data
+ggplot(movies_BE, aes(x = release_year, y = count_BE)) +
+  geom_line(color = "blue", size = 1) + # Line chart
+  geom_point(color = "red", size = 2) + # Add points for emphasis
+  labs(
+    title = "Number of Break-Even Movies Over Time",
+    x = "Release Year",
+    y = "Count of BE = 1 Movies"
+  ) +
+  theme_minimal() +                    # Minimal theme for clean visuals
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1), # Rotate x-axis labels
+    plot.title = element_text(hjust = 0.5)            # Center the title
+  )
+
+
+
+```
+
+
+
 Now here's a Linear Probability Model with BE as our dependent, and our trusty covariates returning for the sequel
 ```{r}
-model3 <- lm(BE ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df)
+model3 <- lm(BE ~ adjusted_budget + runtime + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + rating + is_winter + is_fall + is_summer, data=df)
 summary(model3)
 ```
-While this model is awful (see the R-Squared), I think the negative coefficient on adjusted_budget is interesting. Let's add a polynomial for it in our logit and probit, which we run below.
+Tis model is awful (see the R-Squared). Let's try Probit and Logit, they're better for this type of task. It's also going to calculate McFadden's Pseudo R-Squared to check how good the model is. It's interpreted similar to a normal R-Squared. 
 
 ```{r}
-logit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df, family = binomial(link = "logit"))
+logit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer + rating, data=df, family = binomial(link = "logit"))
 summary(logit_model)
+print(pR2(logit_model)['McFadden'])
 ```
-So the sign of adjusted_budget switches with the polynomial. 
+McFadden's R-Squared is awful. This model doesn't tell us anything.
+And the Probit
 
 ```{r}
-probit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + is_winter + is_fall + is_summer, data=df, family = binomial(link = "probit"))
+probit_model <- glm(BE ~ adjusted_budget + I(adjusted_budget^2) + runtime + I(runtime^2) + Mystery + Thriller + Drama + Crime + Romance + Action + Comedy + Animation + Family + Fantasy + Horror + Adventure + War + History + Western + Music + Documentary + rating + is_winter + is_fall + is_summer, data=df, family = binomial(link = "probit"))
 summary(probit_model)
+print(pR2(probit_model)['McFadden'])
 ```
+The McFadden's is also awful here, but let's push forward anyway. 
 Let's see if the probit or the logit is better at predicting our movies
 ```{r}
 # 1. Predict probabilities using the models
@@ -283,6 +368,7 @@ Now, let's studio produce the movie most likely to break even. We'll assume a fi
 # Define your fixed budget
 fixed_budget <- mean(df$adjusted_budget)
 fixed_runtime <- mean(df$runtime)
+fixed_rating <- mean(df$rating)
 
 # Define possible genres and seasons
 genres <- c("Mystery", "Thriller", "Drama", "Crime", "Romance", "Action", "Comedy", 
@@ -320,6 +406,7 @@ for (i in 1:nrow(combinations_df)) {
   temp_df <- data.frame(
     adjusted_budget = fixed_budget,
     runtime = fixed_runtime,
+    rating = fixed_rating,
     Mystery = 0, Thriller = 0, Drama = 0, Crime = 0, Romance = 0, Action = 0,
     Comedy = 0, Animation = 0, Family = 0, Fantasy = 0, Horror = 0, Adventure = 0, 
     War = 0, History = 0, Western = 0, Music = 0, Documentary = 0,
